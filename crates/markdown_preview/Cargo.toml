@@ -39,5 +39,6 @@ db = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
 fs.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
+markdown = { workspace = true, features = ["test-support"] }
 serde_json.workspace = true
 workspace = { workspace = true, features = ["test-support"] }

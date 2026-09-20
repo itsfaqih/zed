@@ -87,14 +87,14 @@ impl AgentContextSource {
             return None;
         }
 
-        if let Some(active_item) = workspace.active_item(cx) {
+        if let Some(active_item) = workspace.active_item(cx)
+            && active_item
+                .item_focus_handle(cx)
+                .contains_focused(window, cx)
+        {
             if let Some(editor) = active_item.act_as::<Editor>(cx) {
-                if editor.focus_handle(cx).is_focused(window) {
-                    return Some(Self::Editor(editor.downgrade()));
-                }
-            } else if let Some(terminal_view) = active_item.act_as::<TerminalView>(cx)
-                && terminal_view.focus_handle(cx).is_focused(window)
-            {
+                return Some(Self::Editor(editor.downgrade()));
+            } else if let Some(terminal_view) = active_item.act_as::<TerminalView>(cx) {
                 return Some(Self::TerminalView(terminal_view.downgrade()));
             }
         }

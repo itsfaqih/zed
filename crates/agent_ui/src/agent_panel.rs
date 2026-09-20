@@ -6933,7 +6933,7 @@ mod tests {
     use parking_lot::Mutex;
     use project::{Project, WorktreePaths};
     use settings::{SettingsStore, WorkingDirectory};
-    use std::any::Any;
+    use std::any::{Any, TypeId};
 
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -9460,6 +9460,115 @@ mod tests {
         // Lines are 1-based and inclusive; the path is presented as
         // `<rel-path>:<start>-<end>`, with a trailing space.
         assert_eq!(pasted, "file.rs:2-3 ");
+    }
+
+    struct EditorBackedTestItem {
+        editor: Entity<Editor>,
+        focus_handle: FocusHandle,
+    }
+
+    impl EventEmitter<()> for EditorBackedTestItem {}
+
+    impl Focusable for EditorBackedTestItem {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for EditorBackedTestItem {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            gpui::div().track_focus(&self.focus_handle)
+        }
+    }
+
+    impl workspace::item::Item for EditorBackedTestItem {
+        type Event = ();
+
+        fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+            "Editor-backed test item".into()
+        }
+
+        fn act_as_type<'a>(
+            &'a self,
+            type_id: TypeId,
+            self_handle: &'a Entity<Self>,
+            _: &'a App,
+        ) -> Option<gpui::AnyEntity> {
+            if type_id == TypeId::of::<Self>() {
+                Some(self_handle.clone().into())
+            } else if type_id == TypeId::of::<Editor>() {
+                Some(self.editor.clone().into())
+            } else {
+                None
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn focused_editor_backed_item_provides_selection_source(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.md": "line one\nline two\n" }))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                workspace.open_paths(
+                    vec![PathBuf::from("/project/file.md")],
+                    workspace::OpenOptions::default(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .await;
+        cx.run_until_parked();
+
+        let editor = workspace.update(&mut cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.act_as::<Editor>(cx))
+                .expect("opened file should be an editor")
+        });
+        editor.update_in(&mut cx, |editor, window, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([text::Point::new(0, 0)..text::Point::new(0, 4)]);
+            });
+        });
+        cx.run_until_parked();
+
+        let item = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let item = cx.new(|cx| EditorBackedTestItem {
+                editor: editor.clone(),
+                focus_handle: cx.focus_handle(),
+            });
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            item
+        });
+        cx.run_until_parked();
+        cx.focus(&item);
+        cx.run_until_parked();
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let source = AgentContextSource::from_focused(workspace, window, cx)
+                .expect("focused editor-backed items should provide an editor source");
+            let selection = source
+                .read_selection(workspace, true, cx)
+                .expect("the backing editor selection should be readable");
+            assert!(
+                matches!(selection, AgentContextSelection::Editor(ranges) if !ranges.is_empty())
+            );
+        });
     }
 
     async fn setup_panel(cx: &mut TestAppContext) -> (Entity<AgentPanel>, VisualTestContext) {

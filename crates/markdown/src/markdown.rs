@@ -506,6 +506,7 @@ pub struct Markdown {
     context_menu_link: Option<SharedString>,
     context_menu_selected_text: Option<SharedString>,
     context_menu_selected_markdown: Option<SharedString>,
+    context_menu_selected_source_range: Option<Range<usize>>,
     search_highlights: Rc<[Range<usize>]>,
     active_search_highlight: Option<usize>,
 }
@@ -701,6 +702,7 @@ impl Markdown {
             context_menu_link: None,
             context_menu_selected_text: None,
             context_menu_selected_markdown: None,
+            context_menu_selected_source_range: None,
             search_highlights: Rc::default(),
             active_search_highlight: None,
         };
@@ -1080,6 +1082,27 @@ impl Markdown {
         self.selection.end > self.selection.start
     }
 
+    pub fn selected_source_range(&self) -> Option<Range<usize>> {
+        self.has_selection()
+            .then(|| self.selection.start..self.selection.end)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_selection_for_test(&mut self, range: Range<usize>) {
+        self.selection = Selection {
+            start: range.start,
+            end: range.end,
+            reversed: false,
+            pending: false,
+            mode: SelectMode::Character,
+        };
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn capture_context_menu_for_test(&mut self) {
+        self.capture_for_context_menu(None, None);
+    }
+
     pub fn selected_source(&self) -> Option<&str> {
         if self.selection.end <= self.selection.start {
             return None;
@@ -1157,6 +1180,7 @@ impl Markdown {
     ) {
         let range = self.selection.start..self.selection.end;
         if range.end > range.start {
+            self.context_menu_selected_source_range = Some(range.clone());
             self.context_menu_selected_markdown = Some(SharedString::new(
                 self.parsed_markdown
                     .rebalanced_markdown_for_selection(range.clone()),
@@ -1168,6 +1192,7 @@ impl Markdown {
         } else {
             self.context_menu_selected_markdown = None;
             self.context_menu_selected_text = None;
+            self.context_menu_selected_source_range = None;
         }
         self.context_menu_link = link;
     }
@@ -1190,6 +1215,14 @@ impl Markdown {
     /// [`ParsedMarkdown::rebalanced_markdown_for_selection`].
     pub fn context_menu_selected_markdown(&self) -> Option<&SharedString> {
         self.context_menu_selected_markdown.as_ref()
+    }
+
+    pub fn context_menu_selected_source_range(&self) -> Option<Range<usize>> {
+        self.context_menu_selected_source_range.clone()
+    }
+
+    pub fn take_context_menu_selected_source_range(&mut self) -> Option<Range<usize>> {
+        self.context_menu_selected_source_range.take()
     }
 
     fn parse(&mut self, cx: &mut Context<Self>) {
@@ -6782,6 +6815,7 @@ mod tests {
         });
         cx.update(|_window, cx| {
             let markdown = markdown.read(cx);
+            assert_eq!(markdown.selected_source_range(), Some(5..9));
             assert_eq!(
                 markdown.context_menu_link().map(SharedString::as_ref),
                 Some("https://example.com")
@@ -6798,6 +6832,7 @@ mod tests {
                     .map(SharedString::as_ref),
                 Some("text")
             );
+            assert_eq!(markdown.context_menu_selected_source_range(), Some(5..9));
         });
 
         // Simulates right-clicking on plain text with no selection — everything is cleared
@@ -6808,9 +6843,11 @@ mod tests {
         });
         cx.update(|_window, cx| {
             let markdown = markdown.read(cx);
+            assert!(markdown.selected_source_range().is_none());
             assert!(markdown.context_menu_link().is_none());
             assert!(markdown.context_menu_selected_markdown().is_none());
             assert!(markdown.context_menu_selected_text().is_none());
+            assert!(markdown.context_menu_selected_source_range().is_none());
         });
     }
 
