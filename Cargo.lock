@@ -10724,6 +10724,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "buffer_diff",
+ "clock",
  "db",
  "editor",
  "fs",
