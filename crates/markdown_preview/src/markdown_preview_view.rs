@@ -46,7 +46,10 @@ use workspace::searchable::{
     Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
 };
 use workspace::{ItemId, Pane, SaveIntent, Workspace, WorkspaceId, delete_unloaded_items};
-use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
+use zed_actions::{
+    DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
+    agent::AddSelectionToThread,
+};
 
 use crate::markdown_preview_settings::MarkdownPreviewSettings;
 use crate::{
@@ -73,6 +76,7 @@ pub struct MarkdownPreviewView {
     scroll_handle: ScrollHandle,
     image_cache: Entity<RetainAllImageCache>,
     base_directory: Option<PathBuf>,
+    rendered_source: Option<RenderedSourceBinding>,
     pending_update_task: Option<Task<Result<()>>>,
     hovered_url: Option<SharedString>,
     mode: MarkdownPreviewMode,
@@ -108,6 +112,13 @@ impl MarkdownPreviewMode {
 struct EditorState {
     editor: Entity<Editor>,
     _subscription: Subscription,
+}
+
+#[derive(Clone)]
+struct RenderedSourceBinding {
+    editor: Entity<Editor>,
+    buffer: Entity<Buffer>,
+    buffer_version: clock::Global,
 }
 
 #[derive(Default)]
@@ -413,6 +424,7 @@ impl MarkdownPreviewView {
                 scroll_handle: ScrollHandle::new(),
                 image_cache: RetainAllImageCache::new(cx),
                 base_directory: None,
+                rendered_source: None,
                 pending_update_task: None,
                 hovered_url: None,
                 mode,
@@ -678,26 +690,30 @@ impl MarkdownPreviewView {
                     return None;
                 }
 
+                let rendered_editor = editor.clone();
                 editor.update(cx, |editor, cx| {
-                    let contents = editor
-                        .buffer()
-                        .read(cx)
-                        .as_singleton()?
-                        .read(cx)
-                        .as_rope()
-                        .to_string()
-                        .into();
+                    let buffer = editor.buffer().read(cx).as_singleton()?.clone();
+                    let contents = buffer.read(cx).as_rope().to_string().into();
                     let selection_start = Self::selected_source_index(editor, cx)?;
-                    Some((contents, selection_start))
+                    Some((
+                        contents,
+                        selection_start,
+                        RenderedSourceBinding {
+                            editor: rendered_editor,
+                            buffer: buffer.clone(),
+                            buffer_version: buffer.read(cx).version().clone(),
+                        },
+                    ))
                 })
             })?;
 
             view.update(cx, move |view, cx| {
-                if let Some((contents, selection_start)) = update {
+                if let Some((contents, selection_start, rendered_source)) = update {
                     view.hovered_url = None;
                     view.markdown.update(cx, |markdown, cx| {
                         markdown.reset(contents, cx);
                     });
+                    view.rendered_source = Some(rendered_source);
                     view.markdown_parse_pending = view.markdown.read(cx).is_parsing();
                     view.sync_preview_to_source_index(selection_start, should_reveal_selection, cx);
                     cx.emit(SearchEvent::MatchesInvalidated);
@@ -809,6 +825,80 @@ impl MarkdownPreviewView {
                 window.focus(&editor.focus_handle(cx), cx);
             }
         });
+    }
+
+    fn select_bound_source_range(
+        active_editor: &Entity<Editor>,
+        rendered_source: &RenderedSourceBinding,
+        source_range: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        if active_editor != &rendered_source.editor || source_range.start >= source_range.end {
+            return false;
+        }
+        let Some(buffer) = active_editor.read(cx).buffer().read(cx).as_singleton() else {
+            return false;
+        };
+        if buffer != rendered_source.buffer
+            || buffer.read(cx).version() != rendered_source.buffer_version
+            || source_range.end > buffer.read(cx).snapshot().len()
+        {
+            return false;
+        }
+
+        active_editor.update(cx, |editor, cx| {
+            let selection =
+                MultiBufferOffset(source_range.start)..MultiBufferOffset(source_range.end);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges(vec![selection])
+            });
+        });
+        true
+    }
+
+    fn add_selection_to_agent_thread(
+        &mut self,
+        _: &AddSelectionToThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_update_task.is_some()
+            || self.markdown_parse_pending
+            || self.markdown.read(cx).is_parsing()
+        {
+            return;
+        }
+        let source_range = self
+            .markdown
+            .read(cx)
+            .context_menu_selected_source_range()
+            .or_else(|| self.markdown.read(cx).selected_source_range());
+        let Some(source_range) = source_range else {
+            return;
+        };
+        let Some(active_editor) = self
+            .active_editor
+            .as_ref()
+            .map(|state| state.editor.clone())
+        else {
+            return;
+        };
+        let Some(rendered_source) = self.rendered_source.as_ref() else {
+            return;
+        };
+
+        if !Self::select_bound_source_range(
+            &active_editor,
+            rendered_source,
+            source_range,
+            window,
+            cx,
+        ) {
+            return;
+        }
+
+        cx.propagate();
     }
 
     /// The absolute path of the file that is currently being previewed.
@@ -1781,6 +1871,7 @@ impl Render for MarkdownPreviewView {
             .on_action(cx.listener(MarkdownPreviewView::increase_font_size))
             .on_action(cx.listener(MarkdownPreviewView::decrease_font_size))
             .on_action(cx.listener(MarkdownPreviewView::reset_font_size))
+            .on_action(cx.listener(MarkdownPreviewView::add_selection_to_agent_thread))
             .w_full()
             .flex_1()
             .min_h_0()
@@ -1799,25 +1890,42 @@ impl Render for MarkdownPreviewView {
                             let markdown_element =
                                 self.render_markdown_element(&preview_theme, window, cx);
                             let markdown = self.markdown.clone();
+                            let markdown_for_trigger = markdown.clone();
+                            let active_editor = self
+                                .active_editor
+                                .as_ref()
+                                .map(|state| state.editor.clone());
+                            let focus_handle = self.focus_handle.clone();
                             let max_width = MarkdownPreviewSettings::get_global(cx).max_width;
                             let content = right_click_menu("markdown-preview-context-menu")
-                                .trigger(move |_, _, _| markdown_element)
+                                .trigger(move |is_menu_active, _, cx| {
+                                    if !is_menu_active {
+                                        markdown_for_trigger.update(cx, |markdown, _| {
+                                            markdown.clear_context_menu_selection();
+                                        });
+                                    }
+                                    markdown_element
+                                })
                                 .maybe_menu(move |window, cx| {
-                                    let focus = window.focused(cx);
                                     let markdown = markdown.read(cx);
                                     let context_menu_link = markdown.context_menu_link().cloned();
                                     let selected_text =
                                         markdown.context_menu_selected_text().cloned();
                                     let selected_markdown =
                                         markdown.context_menu_selected_markdown().cloned();
+                                    let selected_source_range =
+                                        markdown.context_menu_selected_source_range();
                                     if context_menu_link.is_none()
                                         && selected_text.is_none()
                                         && selected_markdown.is_none()
                                     {
                                         return None;
                                     }
+                                    let selected_source_range = selected_source_range.clone();
+                                    let active_editor = active_editor.clone();
+                                    let focus_handle = focus_handle.clone();
                                     Some(ContextMenu::build(window, cx, move |menu, _, _cx| {
-                                        menu.when_some(focus, |menu, focus| menu.context(focus))
+                                        menu.context(focus_handle)
                                             .when_some(selected_text, |menu, text| {
                                                 menu.entry(
                                                     "Copy",
@@ -1844,6 +1952,15 @@ impl Render for MarkdownPreviewView {
                                                     },
                                                 )
                                             })
+                                            .when_some(
+                                                selected_source_range.zip(active_editor),
+                                                |menu, _| {
+                                                    menu.action(
+                                                        "Add to Agent Thread",
+                                                        Box::new(AddSelectionToThread),
+                                                    )
+                                                },
+                                            )
                                             .when_some(context_menu_link, |menu, url| {
                                                 menu.entry("Copy Link", None, move |_, cx| {
                                                     cx.write_to_clipboard(
@@ -2205,16 +2322,19 @@ mod tests {
     use crate::markdown_preview_view::resolve_preview_image;
     use crate::markdown_preview_view::resolve_project_path_for_preview_image;
     use buffer_diff::BufferDiff;
-    use editor::Editor;
     use editor::items::open_resolved_target;
+    use editor::{Editor, MultiBufferOffset};
     use fs::FakeFs;
     use gpui::UpdateGlobal as _;
     use gpui::{
-        App, AppContext as _, Entity, Focusable as _, Modifiers, TestAppContext, WindowHandle, px,
+        App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement, IntoElement,
+        Modifiers, MouseButton, ParentElement, Render, Styled, TestAppContext, VisualTestContext,
+        Window, WindowHandle, div, point, px,
     };
     use language::{Buffer, DiskState, Point};
     use project::{Project, ProjectPath};
     use serde_json::json;
+    use std::cell::Cell;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
@@ -2227,11 +2347,68 @@ mod tests {
     use workspace::{
         AppState, ItemId, MultiWorkspace, Pane, SaveIntent, Workspace, WorkspaceId, open_paths,
     };
+    use zed_actions::agent::AddSelectionToThread;
 
     use super::{
-        MarkdownPreviewView, filter_non_rendered_matches, open_preview_url,
+        MarkdownPreviewMode, MarkdownPreviewView, filter_non_rendered_matches, open_preview_url,
         reset_persisted_font_size,
     };
+
+    struct MarkdownPreviewTestRoot {
+        preview: Entity<MarkdownPreviewView>,
+        editor: Entity<Editor>,
+        action_propagated: Arc<Cell<bool>>,
+    }
+
+    impl Render for MarkdownPreviewTestRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let action_propagated = self.action_propagated.clone();
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .on_action(move |_: &AddSelectionToThread, _, _| {
+                    action_propagated.set(true);
+                })
+                .child(
+                    div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .child(self.preview.clone()),
+                )
+        }
+    }
+
+    async fn markdown_preview_test_root<'a>(
+        source: &'static str,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<MarkdownPreviewTestRoot>, &'a mut VisualTestContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        cx.add_window_view({
+            let project = project.clone();
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::test_new(project.clone(), window, cx));
+                let buffer = cx.new(|cx| Buffer::local(source, cx));
+                let editor =
+                    cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
+                let preview = MarkdownPreviewView::new(
+                    MarkdownPreviewMode::Default,
+                    editor.clone(),
+                    workspace.downgrade(),
+                    project.read(cx).languages().clone(),
+                    window,
+                    cx,
+                );
+                MarkdownPreviewTestRoot {
+                    preview,
+                    editor,
+                    action_propagated: Arc::new(Cell::new(false)),
+                }
+            }
+        })
+    }
 
     #[test]
     fn filters_matches_in_non_rendered_link_source() {
@@ -2277,6 +2454,157 @@ mod tests {
             preview.read_with(cx, |preview, cx| preview.tab_tooltip_text(cx)),
             source_tooltip
         );
+    }
+
+    #[gpui::test]
+    async fn markdown_preview_context_menu_action_selects_exact_source_range(
+        cx: &mut TestAppContext,
+    ) {
+        let (root, cx) = markdown_preview_test_root("# Heading\n\nhello world\n", cx).await;
+        let preview = root.read_with(cx, |root, _| root.preview.clone());
+        let editor = root.read_with(cx, |root, _| root.editor.clone());
+        cx.run_until_parked();
+        preview.update(cx, |preview, cx| {
+            preview.markdown.update(cx, |markdown, cx| {
+                markdown.reset("# Heading\n\nhello world\n".into(), cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        preview.update(cx, |preview, cx| {
+            preview.markdown.update(cx, |markdown, _cx| {
+                markdown.set_selection_for_test(0..9);
+                markdown.capture_context_menu_for_test();
+            });
+        });
+        assert!(preview.read_with(cx, |preview, _| { preview.active_editor.is_some() }));
+        let click_position = point(px(800.), px(40.));
+
+        cx.update(|window, cx| window.blur(cx));
+
+        cx.simulate_mouse_down(click_position, MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(click_position, MouseButton::Right, Modifiers::default());
+
+        for _ in 0..2 {
+            cx.update(|window, cx| window.simulate_next_frame(cx));
+        }
+
+        preview.update(cx, |preview, cx| {
+            preview.markdown.update(cx, |markdown, _cx| {
+                markdown.set_selection_for_test(12..17);
+            });
+        });
+
+        let menu_item = cx
+            .debug_bounds("MENU_ITEM-Add to Agent Thread")
+            .expect("preview context menu should contain Add to Agent Thread");
+        cx.simulate_click(menu_item.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        let selected_range = editor.update(cx, |editor, cx| {
+            editor
+                .selections
+                .newest::<MultiBufferOffset>(&editor.display_snapshot(cx))
+                .range()
+        });
+        assert_eq!(selected_range, MultiBufferOffset(0)..MultiBufferOffset(9));
+        assert!(root.read_with(cx, |root, _| root.action_propagated.get()));
+        assert!(preview.read_with(cx, |preview, cx| {
+            preview
+                .markdown
+                .read(cx)
+                .context_menu_selected_source_range()
+                .is_none()
+        }));
+    }
+
+    #[gpui::test]
+    async fn markdown_preview_keyboard_action_selects_live_source_range(cx: &mut TestAppContext) {
+        let (root, cx) = markdown_preview_test_root("# Heading\n\nhello world\n", cx).await;
+        let (preview, editor) =
+            root.read_with(cx, |root, _| (root.preview.clone(), root.editor.clone()));
+        cx.run_until_parked();
+        preview.update(cx, |preview, cx| {
+            preview.markdown.update(cx, |markdown, _cx| {
+                markdown.set_selection_for_test(12..17);
+            });
+        });
+
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.focus(&preview.read(cx).focus_handle(cx), cx);
+            window.dispatch_action(Box::new(AddSelectionToThread), cx);
+        });
+
+        let selected_range = editor.update(cx, |editor, cx| {
+            editor
+                .selections
+                .newest::<MultiBufferOffset>(&editor.display_snapshot(cx))
+                .range()
+        });
+        assert_eq!(selected_range, MultiBufferOffset(12)..MultiBufferOffset(17));
+        assert!(root.read_with(cx, |root, _| root.action_propagated.get()));
+    }
+
+    #[gpui::test]
+    async fn markdown_preview_consumes_add_to_agent_thread_without_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (root, cx) = markdown_preview_test_root("# Heading\n", cx).await;
+        let preview = root.read_with(cx, |root, _| root.preview.clone());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.focus(&preview.read(cx).focus_handle(cx), cx);
+            window.dispatch_action(Box::new(AddSelectionToThread), cx);
+        });
+
+        assert!(
+            root.read_with(cx, |root, _| !root.action_propagated.get()),
+            "a preview action without a selection must not reach a parent handler"
+        );
+    }
+
+    #[gpui::test]
+    async fn markdown_preview_rejects_stale_or_invalid_source_ranges(cx: &mut TestAppContext) {
+        let (root, cx) = markdown_preview_test_root("# Heading\n", cx).await;
+        let (preview, editor) =
+            root.read_with(cx, |root, _| (root.preview.clone(), root.editor.clone()));
+        cx.run_until_parked();
+        let (rendered_source, buffer) = preview.read_with(cx, |preview, _| {
+            let rendered_source = preview
+                .rendered_source
+                .clone()
+                .expect("initial source should be bound to the preview");
+            (rendered_source.clone(), rendered_source.buffer)
+        });
+
+        cx.update(|window, cx| {
+            assert!(!MarkdownPreviewView::select_bound_source_range(
+                &editor,
+                &rendered_source,
+                0..usize::MAX,
+                window,
+                cx,
+            ));
+        });
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "changed\n")], None, cx)
+        });
+        cx.update(|window, cx| {
+            assert!(!MarkdownPreviewView::select_bound_source_range(
+                &editor,
+                &rendered_source,
+                0..1,
+                window,
+                cx,
+            ));
+        });
+        assert!(editor.update(cx, |editor, cx| {
+            !editor.has_non_empty_selection(&editor.display_snapshot(cx))
+        }));
     }
 
     #[gpui::test]

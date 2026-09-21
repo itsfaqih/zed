@@ -504,8 +504,7 @@ pub struct Markdown {
     wrapped_code_blocks: HashSet<usize>,
     code_block_scroll_handles: BTreeMap<usize, ScrollHandle>,
     context_menu_link: Option<SharedString>,
-    context_menu_selected_text: Option<SharedString>,
-    context_menu_selected_markdown: Option<SharedString>,
+    context_menu_selection: Option<ContextMenuSelection>,
     search_highlights: Rc<[Range<usize>]>,
     active_search_highlight: Option<usize>,
 }
@@ -699,8 +698,7 @@ impl Markdown {
             wrapped_code_blocks: HashSet::default(),
             code_block_scroll_handles: BTreeMap::default(),
             context_menu_link: None,
-            context_menu_selected_text: None,
-            context_menu_selected_markdown: None,
+            context_menu_selection: None,
             search_highlights: Rc::default(),
             active_search_highlight: None,
         };
@@ -1043,6 +1041,7 @@ impl Markdown {
         }
         self.source = source;
         self.selection = Selection::default();
+        self.context_menu_selection = None;
         self.autoscroll_request = None;
         self.pending_autoscroll = None;
         self.pending_parse = None;
@@ -1078,6 +1077,27 @@ impl Markdown {
 
     pub fn has_selection(&self) -> bool {
         self.selection.end > self.selection.start
+    }
+
+    pub fn selected_source_range(&self) -> Option<Range<usize>> {
+        self.has_selection()
+            .then(|| self.selection.start..self.selection.end)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_selection_for_test(&mut self, range: Range<usize>) {
+        self.selection = Selection {
+            start: range.start,
+            end: range.end,
+            reversed: false,
+            pending: false,
+            mode: SelectMode::Character,
+        };
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn capture_context_menu_for_test(&mut self) {
+        self.capture_for_context_menu(None, None);
     }
 
     pub fn selected_source(&self) -> Option<&str> {
@@ -1137,7 +1157,11 @@ impl Markdown {
     }
 
     fn copy_as_markdown(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.context_menu_selected_markdown.take() {
+        if let Some(text) = self
+            .context_menu_selection
+            .take()
+            .map(|selection| selection.markdown)
+        {
             cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
             return;
         }
@@ -1157,17 +1181,21 @@ impl Markdown {
     ) {
         let range = self.selection.start..self.selection.end;
         if range.end > range.start {
-            self.context_menu_selected_markdown = Some(SharedString::new(
+            let markdown = SharedString::new(
                 self.parsed_markdown
                     .rebalanced_markdown_for_selection(range.clone()),
-            ));
-            self.context_menu_selected_text = rendered_text
-                .map(|text| text.text_for_range(range))
+            );
+            let text = rendered_text
+                .map(|text| text.text_for_range(range.clone()))
                 .map(SharedString::new)
-                .or_else(|| self.context_menu_selected_markdown.clone());
+                .unwrap_or_else(|| markdown.clone());
+            self.context_menu_selection = Some(ContextMenuSelection {
+                text,
+                markdown,
+                source_range: range,
+            });
         } else {
-            self.context_menu_selected_markdown = None;
-            self.context_menu_selected_text = None;
+            self.context_menu_selection = None;
         }
         self.context_menu_link = link;
     }
@@ -1182,14 +1210,28 @@ impl Markdown {
     /// Returns the rendered (plain) text that was selected when the most recent
     /// context menu invocation happened.
     pub fn context_menu_selected_text(&self) -> Option<&SharedString> {
-        self.context_menu_selected_text.as_ref()
+        self.context_menu_selection
+            .as_ref()
+            .map(|selection| &selection.text)
     }
 
     /// Returns the markdown that was selected when the most recent context
     /// menu invocation happened, rebalanced via
     /// [`ParsedMarkdown::rebalanced_markdown_for_selection`].
     pub fn context_menu_selected_markdown(&self) -> Option<&SharedString> {
-        self.context_menu_selected_markdown.as_ref()
+        self.context_menu_selection
+            .as_ref()
+            .map(|selection| &selection.markdown)
+    }
+
+    pub fn context_menu_selected_source_range(&self) -> Option<Range<usize>> {
+        self.context_menu_selection
+            .as_ref()
+            .map(|selection| selection.source_range.clone())
+    }
+
+    pub fn clear_context_menu_selection(&mut self) {
+        self.context_menu_selection = None;
     }
 
     fn parse(&mut self, cx: &mut Context<Self>) {
@@ -1412,6 +1454,12 @@ struct Selection {
     reversed: bool,
     pending: bool,
     mode: SelectMode,
+}
+
+struct ContextMenuSelection {
+    text: SharedString,
+    markdown: SharedString,
+    source_range: Range<usize>,
 }
 
 impl Selection {
@@ -6782,6 +6830,7 @@ mod tests {
         });
         cx.update(|_window, cx| {
             let markdown = markdown.read(cx);
+            assert_eq!(markdown.selected_source_range(), Some(5..9));
             assert_eq!(
                 markdown.context_menu_link().map(SharedString::as_ref),
                 Some("https://example.com")
@@ -6798,6 +6847,7 @@ mod tests {
                     .map(SharedString::as_ref),
                 Some("text")
             );
+            assert_eq!(markdown.context_menu_selected_source_range(), Some(5..9));
         });
 
         // Simulates right-clicking on plain text with no selection — everything is cleared
@@ -6808,9 +6858,32 @@ mod tests {
         });
         cx.update(|_window, cx| {
             let markdown = markdown.read(cx);
+            assert!(markdown.selected_source_range().is_none());
             assert!(markdown.context_menu_link().is_none());
             assert!(markdown.context_menu_selected_markdown().is_none());
             assert!(markdown.context_menu_selected_text().is_none());
+            assert!(markdown.context_menu_selected_source_range().is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn test_reset_clears_context_menu_selection_for_changed_source(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        let markdown = cx.new(|cx| Markdown::new("some text".into(), None, None, cx));
+        cx.run_until_parked();
+
+        markdown.update(cx, |markdown, _| {
+            markdown.set_selection_for_test(0..4);
+            markdown.capture_context_menu_for_test();
+        });
+        markdown.update(cx, |markdown, cx| markdown.reset("other text".into(), cx));
+
+        cx.update(|_, cx| {
+            let markdown = markdown.read(cx);
+            assert!(markdown.context_menu_selected_text().is_none());
+            assert!(markdown.context_menu_selected_markdown().is_none());
+            assert!(markdown.context_menu_selected_source_range().is_none());
         });
     }
 
